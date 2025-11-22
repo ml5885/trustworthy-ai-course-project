@@ -96,14 +96,15 @@ if __name__ == "__main__":
         layer=layer,
         step_size=0.1,
         device=device,
-        inner_steps=4,
+        inner_steps=8,
         topk=256,
-        use_cosine=False,
+        bf_batch_size=256,
+        use_cosine=True,
         norm_clip=1.0,
         project_every=25,
         project_always=False,
-        max_vocab_scan=5000,
-        epsilon=1e-3,
+        max_vocab_scan=10000,
+        epsilon=1e-1,
         verbose=True,
     )
 
@@ -112,11 +113,11 @@ if __name__ == "__main__":
     # steering_vector, _ = compute_steering_vector(model, tok, layer, device, n_pairs=n_pairs)
 
     test_prompts = [
-        # 'John said to Mary "',
+        'John said to Mary "',
         'The chef whispered, "',
-        # 'Yesterday I told him that',
-        # 'She asked politely, "',
-        # 'In a letter he wrote, "'
+        'Yesterday I told him that',
+        'She asked politely, "',
+        'In a letter he wrote, "'
     ]
 
     gen_length = 10
@@ -252,7 +253,7 @@ if __name__ == "__main__":
             )
             if recovered_id is None:
                 print(f"Failed to recover token at position {t+1}.")
-                recovered_ids.append(prefix_ids[t])
+                break
             else:
                 recovered_ids.append(recovered_id)
                 

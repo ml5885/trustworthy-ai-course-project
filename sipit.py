@@ -192,13 +192,14 @@ class SipIt:
             
             e_prev = e_new
             pbar.update(len(ranked))
-        pbar.close()
+        # pbar.close()
         
         # If we exhausted the guided proposals without finding a token within epsilon,
         # do a brute-force scan over remaining vocabulary tokens in batches to speed up inference.
         remaining = [i for i in range(self.vocab_size) if i not in visited]
         if remaining:
             # process remaining tokens in chunks
+            pbar = tqdm(total=len(remaining), disable=not self.verbose, desc=f"Brute-force scanning remaining tokens at position {t+1}", unit="candidates")
             for i in range(0, len(remaining), max(1, int(self.bf_batch_size))):
                 chunk = remaining[i : i + int(self.bf_batch_size)]
                 batch_size = len(chunk)
@@ -256,6 +257,8 @@ class SipIt:
                         policy_loss_per_candidate,
                         dist_per_candidate,
                     )
+                pbar.update(batch_size)
+            pbar.close()
 
         # If still not found, return None with accumulated metrics
         return (
