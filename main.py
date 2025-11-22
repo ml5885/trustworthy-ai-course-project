@@ -4,6 +4,8 @@ import random
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import matplotlib.pyplot as plt
+import numpy as np
 
 from sipit import SipIt
 
@@ -84,7 +86,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(model_name)
     tok = AutoTokenizer.from_pretrained(model_name)
 
-    layer = 2
+    layer = 8
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     model.to(device)
@@ -92,29 +94,29 @@ if __name__ == "__main__":
         model,
         tok,
         layer=layer,
-        step_size=1.0,
+        step_size=0.1,
         device=device,
-        inner_steps=2,
-        topk=10,
-        use_cosine=True,
+        inner_steps=4,
+        topk=256,
+        use_cosine=False,
         norm_clip=1.0,
         project_every=25,
         project_always=False,
-        max_vocab_scan=2000,
+        max_vocab_scan=5000,
         epsilon=1e-3,
         verbose=True,
     )
 
     random.seed(42)
     n_pairs = 50
-    steering_vector, _ = compute_steering_vector(model, tok, layer, device, n_pairs=n_pairs)
+    # steering_vector, _ = compute_steering_vector(model, tok, layer, device, n_pairs=n_pairs)
 
     test_prompts = [
-        'John said to Mary "',
+        # 'John said to Mary "',
         'The chef whispered, "',
-        'Yesterday I told him that',
-        'She asked politely, "',
-        'In a letter he wrote, "'
+        # 'Yesterday I told him that',
+        # 'She asked politely, "',
+        # 'In a letter he wrote, "'
     ]
 
     gen_length = 10
@@ -126,116 +128,193 @@ if __name__ == "__main__":
 
     results = []
 
+    # for prompt in test_prompts:
+    #     print('\nPrompt:', prompt)
+    #     cur_ids = tok.encode(prompt, return_tensors="pt").to(device)[0].tolist()
+
+    #     generated = cur_ids.copy()
+    #     last_hb = None
+
+    #     transformer = getattr(model, 'transformer', None)
+    #     hook_handle = None
+
+    #     blocks = None
+    #     if hasattr(model, "layers"):
+    #         blocks = model.layers
+    #     elif hasattr(model, "model") and hasattr(model.model, "layers"):
+    #         blocks = model.model.layers
+    #     elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+    #         blocks = model.transformer.h
+
+    #     if blocks is None:
+    #         raise RuntimeError(f"Cannot find transformer blocks on model; cannot register hook for layer {layer}.")
+
+    #     if not (0 <= layer < len(blocks)):
+    #         raise IndexError(f"Requested layer {layer} out of range (0..{len(blocks)-1}).")
+
+    #     target_block = blocks[layer]
+
+    #     def make_hook(steer, scale):
+    #         def hook(module, inp, out):
+    #             sv = steer.view(1, 1, -1) * float(scale)
+    #             out0 = out[0].clone()
+    #             out0[:, -1:, :] = out0[:, -1:, :] + sv
+    #             if isinstance(out, tuple):
+    #                 new_out = (out0,) + tuple(out[1:])
+    #             elif isinstance(out, list):
+    #                 out_list = list(out)
+    #                 out_list[0] = out0
+    #                 new_out = out_list
+    #             else:
+    #                 new_out = out0
+    #             return new_out
+    #         return hook
+
+    #     hook_handle = target_block.register_forward_hook(make_hook(steering_vector, steering_scale))
+    #     print(f"Registered hook on block {layer}")
+        
+    #     for step in range(gen_length):
+    #         ids_tensor = torch.tensor(generated, device=device).unsqueeze(0)
+    #         inputs_embeds = model.get_input_embeddings()(ids_tensor)
+
+    #         if hook_handle is None:
+    #             if inputs_embeds.size(-1) == steering_vector.size(0):
+    #                 inputs_embeds[0, -1, :] = inputs_embeds[0, -1, :] + steering_scale * steering_vector
+    #             else:
+    #                 proj = steering_vector[: inputs_embeds.size(-1)]
+    #                 inputs_embeds[0, -1, :] = inputs_embeds[0, -1, :] + steering_scale * proj
+
+    #         out = model(inputs_embeds=inputs_embeds, output_hidden_states=True, use_cache=False)
+    #         logits = out.logits
+
+    #         logit = logits[0, -1]
+    #         if sample_top_k is not None and sample_top_k > 0:
+    #             vals, idxs = torch.topk(logit, k=min(sample_top_k, logit.size(-1)))
+    #             probs = F.softmax(vals / float(sample_temperature), dim=-1)
+    #             choice = torch.multinomial(probs, num_samples=1)
+    #             next_id = int(idxs[choice].item())
+    #         else:
+    #             next_id = int(logit.argmax(-1).item())
+    #         generated.append(next_id)
+
+    #         last_hb = out.hidden_states[layer][0, -1, :].detach().to(device)
+
+    #     gen_text = tok.decode(torch.tensor(generated), skip_special_tokens=False)
+    #     results.append({
+    #         'prompt': prompt,
+    #         'gen_text': gen_text,
+    #         'gen_ids': generated,
+    #         'last_hb': last_hb,
+    #         'recovered_id': None,
+    #     })
+
+    #     # print full steered continuation for this prompt
+    #     print(f"Steered generation (strength = {steering_scale}): {gen_text}")
+
+    #     if hook_handle is not None:
+    #         hook_handle.remove()
+    #         print(f"Removed hook from block {layer}")
+
     for prompt in test_prompts:
         print('\nPrompt:', prompt)
-        cur_ids = tok.encode(prompt, return_tensors="pt").to(device)[0].tolist()
-
-        generated = cur_ids.copy()
-        last_hb = None
-
-        transformer = getattr(model, 'transformer', None)
-        hook_handle = None
-
-        blocks = None
-        if hasattr(model, "layers"):
-            blocks = model.layers
-        elif hasattr(model, "model") and hasattr(model.model, "layers"):
-            blocks = model.model.layers
-        elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-            blocks = model.transformer.h
-
-        if blocks is None:
-            raise RuntimeError(f"Cannot find transformer blocks on model; cannot register hook for layer {layer}.")
-
-        if not (0 <= layer < len(blocks)):
-            raise IndexError(f"Requested layer {layer} out of range (0..{len(blocks)-1}).")
-
-        target_block = blocks[layer]
-
-        def make_hook(steer, scale):
-            def hook(module, inp, out):
-                sv = steer.view(1, 1, -1) * float(scale)
-                out0 = out[0].clone()
-                out0[:, -1:, :] = out0[:, -1:, :] + sv
-                if isinstance(out, tuple):
-                    new_out = (out0,) + tuple(out[1:])
-                elif isinstance(out, list):
-                    out_list = list(out)
-                    out_list[0] = out0
-                    new_out = out_list
-                else:
-                    new_out = out0
-                return new_out
-            return hook
-
-        hook_handle = target_block.register_forward_hook(make_hook(steering_vector, steering_scale))
-        print(f"Registered hook on block {layer}")
         
-        for step in range(gen_length):
-            ids_tensor = torch.tensor(generated, device=device).unsqueeze(0)
-            inputs_embeds = model.get_input_embeddings()(ids_tensor)
+        # recover prompt from hidden states
+        prefix_ids = tok.encode(prompt, return_tensors="pt").to(device)[0].tolist()
+        recovered_ids = []
+        policy_min_list = []
+        policy_max_list = []
+        policy_avg_list = []
+        dist_min_list = []
+        dist_max_list = []
+        dist_avg_list = []
+        grad_norm_min_list = []
+        grad_norm_max_list = []
+        grad_norm_avg_list = []
+        policy_loss_per_candidate_per_token = []
+        dist_per_candidate_per_token = []
+        for t in range(len(prefix_ids)):
+            target_h = None
+            with torch.no_grad():
+                ids_tensor = torch.tensor(prefix_ids[:t+1], device=device).unsqueeze(0)
+                out = model(input_ids=ids_tensor, output_hidden_states=True)
+                target_h = out.hidden_states[layer][0, -1, :].detach().to(device)
 
-            if hook_handle is None:
-                if inputs_embeds.size(-1) == steering_vector.size(0):
-                    inputs_embeds[0, -1, :] = inputs_embeds[0, -1, :] + steering_scale * steering_vector
-                else:
-                    proj = steering_vector[: inputs_embeds.size(-1)]
-                    inputs_embeds[0, -1, :] = inputs_embeds[0, -1, :] + steering_scale * proj
-
-            out = model(inputs_embeds=inputs_embeds, output_hidden_states=True, use_cache=False)
-            logits = out.logits
-
-            logit = logits[0, -1]
-            if sample_top_k is not None and sample_top_k > 0:
-                vals, idxs = torch.topk(logit, k=min(sample_top_k, logit.size(-1)))
-                probs = F.softmax(vals / float(sample_temperature), dim=-1)
-                choice = torch.multinomial(probs, num_samples=1)
-                next_id = int(idxs[choice].item())
+            (   recovered_id,
+                pmin, pmax, pavg,
+                dmin, dmax, davg,
+                gmin, gmax, gavg,
+                policy_loss_per_candidate,
+                dist_per_candidate,
+            ) = inverter.recover_position(
+                t=t,
+                prefix_tokens=prefix_ids[:t],
+                target_h=target_h,
+            )
+            if recovered_id is None:
+                print(f"Failed to recover token at position {t+1}.")
+                recovered_ids.append(prefix_ids[t])
             else:
-                next_id = int(logit.argmax(-1).item())
-            generated.append(next_id)
+                recovered_ids.append(recovered_id)
+                
+            policy_loss_per_candidate_per_token.append(policy_loss_per_candidate)
+            dist_per_candidate_per_token.append(dist_per_candidate)
+            
+            policy_min_list.append(min(pavg))
+            policy_max_list.append(max(pavg))
+            policy_avg_list.append(sum(pavg) / len(pavg))
+            
+            dist_min_list.append(min(davg))
+            dist_max_list.append(max(davg))
+            dist_avg_list.append(sum(davg) / len(davg))
+            
+            grad_norm_min_list.append(gmin)
+            grad_norm_max_list.append(gmax)
+            grad_norm_avg_list.append(gavg)
+            
+            p_loss = policy_loss_per_candidate
+            dists = dist_per_candidate
+            
+            plt.figure(figsize=(8, 6))
+            plt.rcParams.update({'font.family': "serif"})
 
-            last_hb = out.hidden_states[layer][0, -1, :].detach().to(device)
+            n = len(dists)
+            indices = np.arange(n)
+            # use reversed viridis so index 0 -> light, last -> dark
+            sc = plt.scatter(dists, p_loss, c=indices, cmap='viridis_r', alpha=0.8)
+            cbar = plt.colorbar(sc)
+            cbar.set_label('Candidate order (0 = first, larger = later)')
 
-        gen_text = tok.decode(torch.tensor(generated), skip_special_tokens=False)
-        results.append({
-            'prompt': prompt,
-            'gen_text': gen_text,
-            'gen_ids': generated,
-            'last_hb': last_hb,
-            'recovered_id': None,
-        })
+            plt.title(f"Position {t+1} - Policy Loss vs Distance")
+            plt.xlabel("Distance Norm")
+            plt.ylabel("Policy Gradient Loss")
+            plt.grid(True)
+            plt.savefig(f"scatter_position_{t+1}.png")
+            plt.close()
+                
+            trials = len(gmin)
 
-        # print full steered continuation for this prompt
-        print(f"Steered generation (strength = {steering_scale}): {gen_text}")
+            x = np.arange(1, trials + 1)
 
-        if hook_handle is not None:
-            hook_handle.remove()
-            print(f"Removed hook from block {layer}")
+            plt.figure(figsize=(8, 6))
+            plt.rcParams.update({'font.family': "serif"})
 
-    # Recover only the last token per prompt
-    print('\nRecovering last token per prompt using SipIT...')
-    for entry in results:
-        prompt = entry['prompt']
-        gen_text = entry['gen_text']
-        gen_ids = entry['gen_ids']
-        last_hb = entry['last_hb']
+            # Shaded area between min and max
+            plt.fill_between(x, gmin, gmax, color='lightblue', alpha=0.3, label='Min-Max Range')
 
-        print('\nPrompt:', prompt)
-        print('Steered generation:', gen_text)
+            # Plot lines on top of the shading
+            plt.plot(x, gmin, label='Grad Norm Min', color='blue')
+            plt.plot(x, gmax, label='Grad Norm Max', color='red')
+            plt.plot(x, gavg, label='Grad Norm Avg', color='green')
 
-        # Recover token for final position
-        recovered_id = inverter.recover_position(t=len(gen_ids) - 1, prefix_tokens=gen_ids[:-1], target_h=last_hb)
-        entry['recovered_id'] = recovered_id
-        rec_tok = tok.convert_ids_to_tokens(recovered_id)
-        print('Recovered last token (SipIT):', rec_tok)
-
-    # Save results
-    with open('sipit_steering_results.txt', 'w') as f:
-        for entry in results:
-            f.write(f"Prompt: {entry['prompt']}\n")
-            f.write(f"Steered generation: {entry['gen_text']}\n")
-            rec_tok = tok.convert_ids_to_tokens(entry['recovered_id'])
-            f.write(f"Recovered last token (SipIT): {rec_tok}\n\n")
-
-    print('\nWrote results to sipit_steering_results.txt')
+            plt.title(f"Position {t+1} - Gradient Norms over Trials")
+            plt.xlabel("Trials")
+            plt.ylabel("Gradient Norm")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"gradnorms_position_{t+1}.png")
+            plt.close()
+            
+        recovered_text = tok.decode(torch.tensor(recovered_ids), skip_special_tokens=False)
+        print(f"Recovered prompt using SipIT: {recovered_text}")
+            
