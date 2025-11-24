@@ -74,7 +74,7 @@ class SipIt:
         if self.max_vocab_scan is None:
             self.max_vocab_scan = self.vocab_size
 
-    def recover_position(self, t, prefix_tokens, target_h):
+    def recover_position(self, t, prefix_tokens, target_h, return_closest=False, early_stop=True):
         visited = set()
         
         if len(prefix_tokens) > 0:
@@ -86,6 +86,9 @@ class SipIt:
         # ensure target hidden state is on the same device
         target_h = target_h.to(self.device)
         trials = 0
+        
+        best_token_global = None
+        best_dist_global = float('inf')
         
         policy_min = []
         policy_max = []
@@ -147,8 +150,13 @@ class SipIt:
                 for idx, dist_val in enumerate(dists):
                     policy_loss_per_candidate.append(float(policy_val))
                     dist_per_candidate.append(float(dist_val))
+                    
+                    if dist_val < best_dist_global:
+                        best_dist_global = dist_val
+                        best_token_global = int(ranked[idx])
+
                     trials += 1
-                    if dist_val <= self.epsilon and hit_index is None:
+                    if early_stop and dist_val <= self.epsilon and hit_index is None:
                         hit_index = idx
                         break
                     else:
@@ -157,7 +165,7 @@ class SipIt:
                     if trials >= self.max_vocab_scan:
                         break
 
-                if hit_index is not None:
+                if early_stop and hit_index is not None:
                     # compute stats only over the scanned candidates up to and including the hit
                     prefix_dists = dists[: hit_index + 1]
                     dist_min.append(min(prefix_dists))
@@ -242,6 +250,11 @@ class SipIt:
                 min_idx = int(torch.argmin(torch.tensor(dists)).item())
                 best_dist = dists[min_idx]
                 best_token = int(chunk[min_idx])
+                
+                if best_dist < best_dist_global:
+                    best_dist_global = best_dist
+                    best_token_global = best_token
+
                 if best_dist <= self.epsilon:
                     return (
                         int(best_token),
@@ -261,8 +274,10 @@ class SipIt:
             pbar.close()
 
         # If still not found, return None with accumulated metrics
+        final_token = best_token_global if return_closest else None
+        
         return (
-            None,
+            final_token,
             policy_min,
             policy_max,
             policy_avg,
