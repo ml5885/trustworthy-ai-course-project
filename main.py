@@ -1,9 +1,12 @@
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import random
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -192,7 +195,7 @@ def run_steering_experiment(model, tok, layer, device, test_prompts, steering_ve
     
     return avg_score
 
-def run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=None, steering_scale=0.0):
+def run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=None, steering_scale=0.0, experiment_name="prompt"):
     for prompt in test_prompts:
         print('\nPrompt:', prompt)
         
@@ -258,7 +261,7 @@ def run_recovery_experiment(model, tok, layer, device, test_prompts, steering_ve
             p_loss = policy_loss_per_candidate
             dists = dist_per_candidate
             
-            prompt_dir = f"prompt_{t+1}"
+            prompt_dir = f"{experiment_name}_{t+1}"
             os.makedirs(prompt_dir, exist_ok=True)
 
             plt.figure(figsize=(8, 6))
@@ -299,10 +302,13 @@ def run_recovery_experiment(model, tok, layer, device, test_prompts, steering_ve
             
         recovered_text = tok.decode(torch.tensor(recovered_ids), skip_special_tokens=False)
         print(f"Recovered prompt using SipIT: {recovered_text}")
+        print(f"Recovered tokens: {recovered_ids}")
+
+        if steering_vector is not None:
+            print(f"Running generation check for recovered prompt: '{recovered_text}'")
+            run_steering_experiment(model, tok, layer, device, [recovered_text], steering_vector, steering_scale=0.0, verbose=True)
 
 if __name__ == "__main__":
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
     # model_name = "gpt2"
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -373,4 +379,9 @@ if __name__ == "__main__":
     layer = 4
     scale = 9
     run_steering_experiment(model, tok, layer, device, test_prompts, steering_vector, scale, verbose=True)
-    run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=steering_vector, steering_scale=scale)
+    run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=steering_vector, steering_scale=scale, experiment_name="steering")
+
+    print("\n--- Running Random Noise Control Experiment ---")
+    random_vector = torch.randn_like(steering_vector)
+    random_vector = F.normalize(random_vector, dim=0)
+    run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=random_vector, steering_scale=scale, experiment_name="control")

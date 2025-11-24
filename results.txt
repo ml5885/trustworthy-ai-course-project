@@ -1,0 +1,46 @@
+--- Running Steering Experiment ---
+
+Steering at layer 4 with steering scale of 9.
+
+Steered generation: John said to Mary " WHAT CAN I DO TO HELP THE FARMER
+Uppercase Score: 0.78
+Steered generation: The chef whispered, " THEY'RE OUT HERE COME NOW" and
+Uppercase Score: 0.67
+Steered generation: Yesterday I told him that  I WERE going TO SUGGEST CATEGORIES
+Uppercase Score: 0.69
+Steered generation: She asked politely, " Could YOU, PLEASE?, let ME USE YOUR P
+Uppercase Score: 0.54
+Steered generation: In a letter he wrote, " EACH MAN" FROM THE SOUTLY was
+Uppercase Score: 0.69
+
+Prompt: John said to Mary "
+Recovered prompt using SipIT: john said to Mary "
+
+Prompt: The chef whispered, "
+Recovered prompt using SipIT: the chef whispered!, "
+
+Prompt: Yesterday I told him that
+Recovered prompt using SipIT: Tomorrow I Tell him that
+
+Prompt: She asked politely, "
+Recovered prompt using SipIT: :I asked politely, "
+
+Prompt: In a letter he wrote, "
+Recovered prompt using SipIT: "In a Letter he wrote, "
+
+--- Running Random Noise Control Experiment ---
+
+Prompt: John said to Mary "
+Recovered prompt using SipIT: john said to Mary "
+
+Prompt: The chef whispered, "
+Recovered prompt using SipIT: A chef whispered, "
+
+Prompt: Yesterday I told him that
+Recovered prompt using SipIT: Tomorrow I told him that
+
+Prompt: She asked politely, "
+Recovered prompt using SipIT: ewe asked politely, "
+
+Prompt: In a letter he wrote, "
+Recovered prompt using SipIT: "In a letter he wrote, "
