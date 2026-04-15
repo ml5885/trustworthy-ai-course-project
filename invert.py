@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 
 import torch
@@ -9,16 +11,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 SEQ_LEN = 32
 BATCH_SIZE = 16
 NUM_STEPS = 5000
-
-BLOCK_LAYER = 4                # transformer block index
-LAYER_IDX = BLOCK_LAYER + 1    # index into hidden_states (0 = embeddings)
 STEERING_SCALE = 9.0
-
-TASK = "sequence"      # "token" or "sequence"
 
 
 STEERING_SENTENCES = [
@@ -177,30 +173,36 @@ def compute_steering_vector(model, tok, layer_idx, device, sentences=STEERING_SE
     return steering_vector.to(device), avg_pair_norm
 
 
-def plot_curves(losses, grad_norms, prefix):
-    os.makedirs("results", exist_ok=True)
-    plt.rcParams["font.family"] = "sans-serif"
+def plot_curves(losses, grad_norms, prefix, outdir="results"):
+    os.makedirs(outdir, exist_ok=True)
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 16,
+        "axes.labelsize": 18,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+    })
     royal_purple = "#7851A9"
     steps = range(len(losses))
 
-    plt.figure()
-    plt.plot(steps, losses, color=royal_purple)
-    plt.xlabel("Training step")
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, losses, color=royal_purple, linewidth=2)
+    plt.xlabel("Training Step")
     plt.ylabel("Loss")
     plt.tight_layout()
-    plt.savefig(f"results/{prefix}_loss.png")
+    plt.savefig(os.path.join(outdir, f"{prefix}_loss.png"), dpi=200)
     plt.close()
 
-    plt.figure()
-    plt.plot(steps, grad_norms, color=royal_purple)
-    plt.xlabel("Training step")
-    plt.ylabel("Gradient norm")
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, grad_norms, color=royal_purple, linewidth=2)
+    plt.xlabel("Training Step")
+    plt.ylabel("Gradient Norm")
     plt.tight_layout()
-    plt.savefig(f"results/{prefix}_grad_norm.png")
+    plt.savefig(os.path.join(outdir, f"{prefix}_grad_norm.png"), dpi=200)
     plt.close()
 
 
-def train_token_probe(lm, tokenizer, device):
+def train_token_probe(lm, tokenizer, device, layer_idx, outdir="results"):
     d_model = lm.config.hidden_size
     vocab_size = lm.config.vocab_size
 
@@ -216,7 +218,7 @@ def train_token_probe(lm, tokenizer, device):
 
         with torch.no_grad():
             out = lm(input_ids=input_ids, output_hidden_states=True)
-            h = out.hidden_states[LAYER_IDX]
+            h = out.hidden_states[layer_idx]
 
         B, T, D = h.shape
         h_flat = h.view(B * T, D)
@@ -246,14 +248,14 @@ def train_token_probe(lm, tokenizer, device):
                 f"acc {acc:.4f}  grad_norm {grad_norm:.4f}"
             )
 
-    plot_curves(losses, grad_norms, "token")
+    plot_curves(losses, grad_norms, "token", outdir=outdir)
 
     test_text = "Transformers are almost surely not injective."
     with torch.no_grad():
         enc = tokenizer(test_text, return_tensors="pt")
         input_ids = enc["input_ids"].to(device)
         out = lm(input_ids=input_ids, output_hidden_states=True)
-        h = out.hidden_states[LAYER_IDX][0]
+        h = out.hidden_states[layer_idx][0]
         logits = probe(h)
         preds = logits.argmax(dim=-1)
 
@@ -262,49 +264,49 @@ def train_token_probe(lm, tokenizer, device):
     input_tokens = [tokenizer.decode([tid]) for tid in input_ids_list]
     pred_tokens = [tokenizer.decode([pid]) for pid in pred_ids_list]
 
-    final_input_id = input_ids_list[-1]
-    final_input_token = tokenizer.decode([final_input_id])
-    final_pred_id = pred_ids_list[-1]
-    final_pred_token = tokenizer.decode([final_pred_id])
+    token_acc = sum(a == b for a, b in zip(input_ids_list, pred_ids_list)) / len(input_ids_list)
 
     print("=== token-level test (no steering) ===")
     print("text:", test_text)
-    print("input_ids:", input_ids_list)
-    print("predicted_ids:", pred_ids_list)
     print("input_tokens:", input_tokens)
     print("predicted_tokens:", pred_tokens)
-    print("final_hidden_state_target_id:", final_input_id)
-    print("final_hidden_state_pred_id:", final_pred_id)
-    print("final_hidden_state_target_token:", final_input_token)
-    print("final_hidden_state_pred_token:", final_pred_token)
+    print(f"token accuracy: {token_acc:.2%}")
 
     # steering-vector test
-    print("\n=== steering-vector test (layer 4, scale 9) ===")
+    print(f"\n=== steering-vector test (layer {layer_idx - 1}, scale {STEERING_SCALE}) ===")
     steering_vector, avg_pair_norm = compute_steering_vector(
-        lm, tokenizer, LAYER_IDX, device
+        lm, tokenizer, layer_idx, device
     )
 
     with torch.no_grad():
         enc = tokenizer(test_text, return_tensors="pt")
         input_ids = enc["input_ids"].to(device)
         out = lm(input_ids=input_ids, output_hidden_states=True)
-        h = out.hidden_states[LAYER_IDX][0].clone()
-
-        # add steering only to the final token's hidden state
+        h = out.hidden_states[layer_idx][0].clone()
         h[-1] = h[-1] + steering_vector * STEERING_SCALE
-
         logits_steered = probe(h)
         preds_steered = logits_steered.argmax(dim=-1)
 
     steered_ids_list = preds_steered.tolist()
     steered_tokens = [tokenizer.decode([tid]) for tid in steered_ids_list]
 
-    print("steering_scale:", STEERING_SCALE)
-    print("steered_predicted_ids:", steered_ids_list)
     print("steered_predicted_tokens:", steered_tokens)
 
+    results = {
+        "test_text": test_text,
+        "input_tokens": input_tokens,
+        "predicted_tokens": pred_tokens,
+        "token_accuracy": token_acc,
+        "steered_predicted_tokens": steered_tokens,
+        "steering_scale": STEERING_SCALE,
+        "final_loss": losses[-1],
+    }
+    with open(os.path.join(outdir, "token_probe_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved to {outdir}/token_probe_results.json")
 
-def train_sequence_inverter(lm, tokenizer, device):
+
+def train_sequence_inverter(lm, tokenizer, device, layer_idx, outdir="results"):
     d_model = lm.config.hidden_size
     vocab_size = lm.config.vocab_size
     bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id or 0
@@ -321,7 +323,7 @@ def train_sequence_inverter(lm, tokenizer, device):
 
         with torch.no_grad():
             out = lm(input_ids=input_ids, output_hidden_states=True)
-            h_cond = out.hidden_states[LAYER_IDX][:, -1, :]  # (B, d)
+            h_cond = out.hidden_states[layer_idx][:, -1, :]
 
         logits = inverter(input_ids, h_cond)
         B, T, V = logits.shape
@@ -348,20 +350,20 @@ def train_sequence_inverter(lm, tokenizer, device):
                 f"acc {acc:.4f}  grad_norm {grad_norm:.4f}"
             )
 
-    plot_curves(losses, grad_norms, "sequence")
+    plot_curves(losses, grad_norms, "sequence", outdir=outdir)
 
     test_text = "Transformers are almost surely not injective."
     with torch.no_grad():
         enc = tokenizer(test_text, return_tensors="pt")
         target_ids = enc["input_ids"].to(device)
         out = lm(input_ids=target_ids, output_hidden_states=True)
-        h_target = out.hidden_states[LAYER_IDX][:, -1, :]
+        h_target = out.hidden_states[layer_idx][:, -1, :]
 
         max_len = target_ids.size(1)
         gen_ids = inverter.generate(h_target, max_len)
 
         out_gen = lm(input_ids=gen_ids, output_hidden_states=True)
-        h_gen = out_gen.hidden_states[LAYER_IDX][:, -1, :]
+        h_gen = out_gen.hidden_states[layer_idx][:, -1, :]
         hidden_l2 = torch.norm(h_gen - h_target).item()
 
     target_ids_list = target_ids[0].tolist()
@@ -369,32 +371,57 @@ def train_sequence_inverter(lm, tokenizer, device):
     gen_ids_list = gen_ids[0].tolist()
     gen_tokens = [tokenizer.decode([gid]) for gid in gen_ids_list]
 
+    token_acc = sum(a == b for a, b in zip(target_ids_list, gen_ids_list)) / len(target_ids_list)
+
     print("=== sequence-level test ===")
     print("text:", test_text)
-    print("target_ids:", target_ids_list)
-    print("reconstructed_ids:", gen_ids_list)
     print("target_tokens:", target_tokens)
     print("reconstructed_tokens:", gen_tokens)
-    print("final_hidden_state_L2_distance:", hidden_l2)
+    print(f"token accuracy: {token_acc:.2%}")
+    print(f"hidden state L2: {hidden_l2:.4f}")
+
+    results = {
+        "test_text": test_text,
+        "target_tokens": target_tokens,
+        "reconstructed_tokens": gen_tokens,
+        "token_accuracy": token_acc,
+        "hidden_l2": hidden_l2,
+        "final_loss": losses[-1],
+    }
+    with open(os.path.join(outdir, "sequence_inverter_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved to {outdir}/sequence_inverter_results.json")
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B")
+    parser.add_argument("--layer", type=int, default=4, help="Transformer block index")
+    parser.add_argument("--task", default="both", choices=["token", "sequence", "both"])
+    parser.add_argument("--outdir", default="results")
+    args = parser.parse_args()
 
-    lm = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    layer_idx = args.layer + 1  # hidden_states[0] = embeddings
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.outdir, exist_ok=True)
+
+    print(f"Loading {args.model}...")
+    lm = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16)
     lm.to(device)
     lm.eval()
     for p in lm.parameters():
         p.requires_grad = False
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    if TASK == "token":
-        train_token_probe(lm, tokenizer, device)
-    elif TASK == "sequence":
-        train_sequence_inverter(lm, tokenizer, device)
-    else:
-        raise ValueError("TASK must be 'token' or 'sequence'")
+    tasks = [args.task] if args.task != "both" else ["token", "sequence"]
+    for task in tasks:
+        print(f"\n{'='*40}\n  Running: {task} probe\n{'='*40}")
+        if task == "token":
+            train_token_probe(lm, tokenizer, device, layer_idx, outdir=args.outdir)
+        else:
+            train_sequence_inverter(lm, tokenizer, device, layer_idx, outdir=args.outdir)
 
 
 if __name__ == "__main__":

@@ -3,13 +3,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 import argparse
+import json
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-STEERING_LAYER = 8
-STEERING_STRENGTH = 9.0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SUFFIX_LEN = 20
 REPLACEMENT_LEN = 20
@@ -130,7 +129,7 @@ def judge_uppercase(text):
 def run_generation_check(model, tok, prompt, device, description):
     if len(prompt.strip()) == 0:
         print(f"[{description}] - Empty Prompt (Skipping)")
-        return
+        return {"description": description, "prompt": prompt, "gen": "", "score": 0.0}
 
     inputs = tok(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
@@ -144,6 +143,7 @@ def run_generation_check(model, tok, prompt, device, description):
     print(f"Prompt: {prompt!r}")
     print(f"Gen:    {new_text.strip()}")
     print(f"Score:  {score:.2f}\n")
+    return {"description": description, "prompt": prompt, "gen": new_text.strip(), "score": score}
 
 class VanillaGCG:
     def __init__(self, model, tokenizer, layer_idx, device, mode="suffix"):
@@ -188,6 +188,8 @@ class VanillaGCG:
             print(f"Initial L2 Loss: {initial_loss:.4f}")
             best_loss = initial_loss
 
+        loss_history = [best_loss]
+
         pbar = tqdm(range(GCG_STEPS), desc="Optimizing")
         for _ in pbar:
             current_input_ids = torch.cat([fixed_ids, optim_ids]).unsqueeze(0)
@@ -229,58 +231,120 @@ class VanillaGCG:
                     best_optim_ids = new_candidate_ids[min_idx]
                     optim_ids = best_optim_ids
 
+            loss_history.append(best_loss)
             pbar.set_postfix({"L2 Loss": f"{best_loss:.4f}"})
 
-        return self.tokenizer.decode(best_optim_ids), best_loss
+        return self.tokenizer.decode(best_optim_ids), best_loss, loss_history
+
+def plot_gcg_loss(histories, labels, save_path="results/gcg_loss.png", epsilon=0.1):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 16,
+        "axes.labelsize": 18,
+        "axes.titlesize": 20,
+        "legend.fontsize": 14,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+    })
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for history, label in zip(histories, labels):
+        ax.plot(range(len(history)), history, linewidth=2, label=label)
+
+    ax.axhline(y=epsilon, color="gray", linestyle="--", linewidth=1, label=f"SipIt threshold ($\\epsilon={epsilon}$)")
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("L2 Loss")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved plot to {save_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="suffix", choices=["suffix", "replacement"])
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--layer", type=int, default=8, help="Transformer block index for steering")
+    parser.add_argument("--strength", type=float, default=9.0)
+    parser.add_argument("--mode", default="both", choices=["suffix", "replacement", "both"])
+    parser.add_argument("--outdir", default="results")
     args = parser.parse_args()
 
-    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    print(f"Loading {model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    tok = AutoTokenizer.from_pretrained(model_name)
+    os.makedirs(args.outdir, exist_ok=True)
+    results = {"model": args.model, "layer": args.layer, "strength": args.strength}
+
+    print(f"Loading {args.model}...")
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16)
+    tok = AutoTokenizer.from_pretrained(args.model)
     model.to(DEVICE)
     model.eval()
 
-    steering_vector = compute_steering_vector(model, tok, STEERING_LAYER, DEVICE)
+    steering_vector = compute_steering_vector(model, tok, args.layer, DEVICE)
     test_prompt = 'John said to Mary "'
 
-    print(f"\n--- Computing Target State (Strength {STEERING_STRENGTH}) ---")
-    hook = register_steering_hook(model, STEERING_LAYER, steering_vector, STEERING_STRENGTH)
+    print(f"\n--- Computing Target State (Strength {args.strength}) ---")
+    hook = register_steering_hook(model, args.layer, steering_vector, args.strength)
     target_input = tok(test_prompt, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         out = model(**target_input, output_hidden_states=True, use_cache=False)
-        target_state = out.hidden_states[STEERING_LAYER+1][0, -1, :].detach().clone()
+        target_state = out.hidden_states[args.layer + 1][0, -1, :].detach().clone()
     hook.remove()
     print(f"Target Norm: {target_state.norm().item():.4f}")
 
     with torch.no_grad():
         out_unsteered = model(**target_input, output_hidden_states=True, use_cache=False)
-        unsteered_state = out_unsteered.hidden_states[STEERING_LAYER+1][0, -1, :].detach()
+        unsteered_state = out_unsteered.hidden_states[args.layer + 1][0, -1, :].detach()
     dist = torch.norm(target_state - unsteered_state).item()
     print(f"Sanity Check (Target - Unsteered L2): {dist:.4f}")
     if dist < 0.1:
         print("WARNING: Steering hook didn't seem to apply.")
+    results["steering_l2"] = dist
 
-    gcg = VanillaGCG(model, tok, STEERING_LAYER+1, DEVICE, mode=args.mode)
-    optimized_string, final_loss = gcg.run(test_prompt, target_state)
-    print("\n" + "="*30)
-    print(f"Mode: {args.mode}")
-    print(f"Final L2 Loss: {final_loss:.4f}")
-    print(f"Optimized String: {optimized_string}")
-    if args.mode == "suffix":
-        full_prompt = test_prompt + optimized_string
-    else:
-        full_prompt = optimized_string
-    print(f"Full Input: {full_prompt}")
-    print("="*30 + "\n")
+    modes = [args.mode] if args.mode != "both" else ["suffix", "replacement"]
+    all_histories = []
+    all_labels = []
+    label_map = {"suffix": "Suffix (Random Init)", "replacement": "Replacement (Prompt Init)"}
 
-    print("--- Verification: Generations ---")
-    run_generation_check(model, tok, test_prompt, DEVICE, "Vanilla (Unsteered)")
-    hook = register_steering_hook(model, STEERING_LAYER, steering_vector, STEERING_STRENGTH)
-    run_generation_check(model, tok, test_prompt, DEVICE, f"Steered (Vector {STEERING_STRENGTH})")
-    hook.remove()
-    run_generation_check(model, tok, full_prompt, DEVICE, f"Adversarial ({args.mode})")
+    for mode in modes:
+        gcg = VanillaGCG(model, tok, args.layer + 1, DEVICE, mode=mode)
+        optimized_string, final_loss, loss_history = gcg.run(test_prompt, target_state)
+        all_histories.append(loss_history)
+        all_labels.append(label_map[mode])
+
+        full_prompt = (test_prompt + optimized_string) if mode == "suffix" else optimized_string
+
+        print("\n" + "=" * 30)
+        print(f"Mode: {mode}")
+        print(f"Final L2 Loss: {final_loss:.4f}")
+        print(f"Optimized String: {optimized_string}")
+        print(f"Full Input: {full_prompt}")
+        print("=" * 30 + "\n")
+
+        gen_results = []
+        print("--- Verification: Generations ---")
+        gen_results.append(run_generation_check(model, tok, test_prompt, DEVICE, "Vanilla (Unsteered)"))
+        hook = register_steering_hook(model, args.layer, steering_vector, args.strength)
+        gen_results.append(run_generation_check(model, tok, test_prompt, DEVICE, f"Steered (Vector {args.strength})"))
+        hook.remove()
+        gen_results.append(run_generation_check(model, tok, full_prompt, DEVICE, f"Adversarial ({mode})"))
+
+        results[mode] = {
+            "optimized_string": optimized_string,
+            "full_prompt": full_prompt,
+            "final_loss": final_loss,
+            "loss_history": loss_history,
+            "generations": gen_results,
+        }
+
+    if all_histories:
+        plot_gcg_loss(all_histories, all_labels, save_path=os.path.join(args.outdir, "gcg_loss.png"))
+
+    with open(os.path.join(args.outdir, "gcg_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved results to {os.path.join(args.outdir, 'gcg_results.json')}")
