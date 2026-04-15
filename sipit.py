@@ -74,7 +74,7 @@ class SipIt:
         if self.max_vocab_scan is None:
             self.max_vocab_scan = self.vocab_size
 
-    def recover_position(self, t, prefix_tokens, target_h, return_closest=False, early_stop=True):
+    def recover_position(self, t, prefix_tokens, target_h, return_closest=False, early_stop=True, bruteforce=False):
         visited = set()
         
         if len(prefix_tokens) > 0:
@@ -103,104 +103,105 @@ class SipIt:
         policy_loss_per_candidate = []
         dist_per_candidate = []
         
-        pbar = tqdm(total=self.max_vocab_scan, disable=not self.verbose, desc=f"Recovering token at position {t+1}", unit="candidates")
-        while trials < self.max_vocab_scan:
-            v_star, e_new, ranked, losses, grads = self.policy_gradient(
-                prefix_tokens=prefix_tokens,
-                target_h=target_h,
-                visited=visited,
-                e_prev=e_prev,
-                step_index=trials + 1,
-            )
-                
-            policy_min.append(min(losses))
-            policy_max.append(max(losses))
-            policy_avg.append(sum(losses) / len(losses))
-            policy_val = losses[-1]
-            
-            grad_norm_min.append(min(grads))
-            grad_norm_max.append(max(grads))
-            grad_norm_avg.append(sum(grads) / len(grads))
-            
-            # Evaluate all ranked candidate tokens in a single batched model call
-            n_ranked = len(ranked)
-            if n_ranked > 0:
-                if len(prefix_tokens) > 0:
-                    prefix_ids = torch.tensor(prefix_tokens, device=self.device, dtype=torch.long).unsqueeze(0)
-                    prefix_rep = prefix_ids.repeat(n_ranked, 1)
-                    cand_ids = torch.tensor(ranked, device=self.device, dtype=torch.long).unsqueeze(1)
-                    ids = torch.cat([prefix_rep, cand_ids], dim=1)
-                else:
-                    ids = torch.tensor(ranked, device=self.device, dtype=torch.long).unsqueeze(1)
-
-                out = self.model(
-                    input_ids=ids,
-                    output_hidden_states=True,
-                    use_cache=False,
+        if not bruteforce:
+            pbar = tqdm(total=self.max_vocab_scan, disable=not self.verbose, desc=f"Recovering token at position {t+1}", unit="candidates")
+            while trials < self.max_vocab_scan:
+                v_star, e_new, ranked, losses, grads = self.policy_gradient(
+                    prefix_tokens=prefix_tokens,
+                    target_h=target_h,
+                    visited=visited,
+                    e_prev=e_prev,
+                    step_index=trials + 1,
                 )
-                h_layer = out.hidden_states[self.layer]
-                preds = h_layer[:, -1, :]
-
-                diffs = preds - target_h.unsqueeze(0)
-                dists_tensor = torch.norm(diffs, p=2, dim=1)
-                dists = dists_tensor.cpu().tolist()
-
-                # process distances in the original ranked order, preserving early-return behavior
-                hit_index = None
-                for idx, dist_val in enumerate(dists):
-                    policy_loss_per_candidate.append(float(policy_val))
-                    dist_per_candidate.append(float(dist_val))
                     
-                    if dist_val < best_dist_global:
-                        best_dist_global = dist_val
-                        best_token_global = int(ranked[idx])
-
-                    trials += 1
-                    if early_stop and dist_val <= self.epsilon and hit_index is None:
-                        hit_index = idx
-                        break
+                policy_min.append(min(losses))
+                policy_max.append(max(losses))
+                policy_avg.append(sum(losses) / len(losses))
+                policy_val = losses[-1]
+                
+                grad_norm_min.append(min(grads))
+                grad_norm_max.append(max(grads))
+                grad_norm_avg.append(sum(grads) / len(grads))
+                
+                # Evaluate all ranked candidate tokens in a single batched model call
+                n_ranked = len(ranked)
+                if n_ranked > 0:
+                    if len(prefix_tokens) > 0:
+                        prefix_ids = torch.tensor(prefix_tokens, device=self.device, dtype=torch.long).unsqueeze(0)
+                        prefix_rep = prefix_ids.repeat(n_ranked, 1)
+                        cand_ids = torch.tensor(ranked, device=self.device, dtype=torch.long).unsqueeze(1)
+                        ids = torch.cat([prefix_rep, cand_ids], dim=1)
                     else:
-                        visited.add(int(ranked[idx]))
+                        ids = torch.tensor(ranked, device=self.device, dtype=torch.long).unsqueeze(1)
 
-                    if trials >= self.max_vocab_scan:
-                        break
-
-                if early_stop and hit_index is not None:
-                    # compute stats only over the scanned candidates up to and including the hit
-                    prefix_dists = dists[: hit_index + 1]
-                    dist_min.append(min(prefix_dists))
-                    dist_max.append(max(prefix_dists))
-                    dist_avg.append(sum(prefix_dists) / len(prefix_dists))
-                    v_j = ranked[hit_index]
-                    return (
-                        int(v_j),
-                        policy_min,
-                        policy_max,
-                        policy_avg,
-                        dist_min,
-                        dist_max,
-                        dist_avg,
-                        grad_norm_min,
-                        grad_norm_max,
-                        grad_norm_avg,
-                        policy_loss_per_candidate,
-                        dist_per_candidate,
+                    out = self.model(
+                        input_ids=ids,
+                        output_hidden_states=True,
+                        use_cache=False,
                     )
-                else:
-                    # no hit in this batch: update summary stats for the whole batch
-                    if dists:
-                        dist_min.append(min(dists))
-                        dist_max.append(max(dists))
-                        dist_avg.append(sum(dists) / len(dists))
+                    h_layer = out.hidden_states[self.layer]
+                    preds = h_layer[:, -1, :]
 
-            if dists:
-                dist_min.append(min(dists))
-                dist_max.append(max(dists))
-                dist_avg.append(sum(dists) / len(dists))
-            
-            e_prev = e_new
-            pbar.update(len(ranked))
-        # pbar.close()
+                    diffs = preds - target_h.unsqueeze(0)
+                    dists_tensor = torch.norm(diffs, p=2, dim=1)
+                    dists = dists_tensor.cpu().tolist()
+
+                    # process distances in the original ranked order, preserving early-return behavior
+                    hit_index = None
+                    for idx, dist_val in enumerate(dists):
+                        policy_loss_per_candidate.append(float(policy_val))
+                        dist_per_candidate.append(float(dist_val))
+                        
+                        if dist_val < best_dist_global:
+                            best_dist_global = dist_val
+                            best_token_global = int(ranked[idx])
+
+                        trials += 1
+                        if early_stop and dist_val <= self.epsilon and hit_index is None:
+                            hit_index = idx
+                            break
+                        else:
+                            visited.add(int(ranked[idx]))
+
+                        if trials >= self.max_vocab_scan:
+                            break
+
+                    if early_stop and hit_index is not None:
+                        # compute stats only over the scanned candidates up to and including the hit
+                        prefix_dists = dists[: hit_index + 1]
+                        dist_min.append(min(prefix_dists))
+                        dist_max.append(max(prefix_dists))
+                        dist_avg.append(sum(prefix_dists) / len(prefix_dists))
+                        v_j = ranked[hit_index]
+                        return (
+                            int(v_j),
+                            policy_min,
+                            policy_max,
+                            policy_avg,
+                            dist_min,
+                            dist_max,
+                            dist_avg,
+                            grad_norm_min,
+                            grad_norm_max,
+                            grad_norm_avg,
+                            policy_loss_per_candidate,
+                            dist_per_candidate,
+                        )
+                    else:
+                        # no hit in this batch: update summary stats for the whole batch
+                        if dists:
+                            dist_min.append(min(dists))
+                            dist_max.append(max(dists))
+                            dist_avg.append(sum(dists) / len(dists))
+
+                if dists:
+                    dist_min.append(min(dists))
+                    dist_max.append(max(dists))
+                    dist_avg.append(sum(dists) / len(dists))
+                
+                e_prev = e_new
+                pbar.update(len(ranked))
+            pbar.close()
         
         # If we exhausted the guided proposals without finding a token within epsilon,
         # do a brute-force scan over remaining vocabulary tokens in batches to speed up inference.

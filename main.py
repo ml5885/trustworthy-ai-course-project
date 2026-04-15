@@ -1,19 +1,21 @@
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import random
+os.environ["TRANSFORMERS_NO_TF"] = "1"
 
+import argparse
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
-
 from tqdm import tqdm
 
-from sipit import SipIt
-
+STEERING_LAYER = 8
+STEERING_STRENGTH = 9.0
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SUFFIX_LEN = 20
+REPLACEMENT_LEN = 20
+GCG_STEPS = 200
+BATCH_SIZE = 512
+TOP_K = 64
 
 STEERING_SENTENCES = [
     "The old clock on the wall ticked loudly.",
@@ -69,319 +71,216 @@ STEERING_SENTENCES = [
 ]
 
 def compute_steering_vector(model, tok, layer, device, sentences=STEERING_SENTENCES):
-    print(f"Computing steering vector from {len(sentences)} normal vs UPPERCASE example pairs...")
-
+    print(f"Computing steering vector from {len(sentences)} pairs...")
     diffs = []
     with torch.no_grad():
         for normal in sentences:
             caps = normal.upper()
-
             ids_norm = tok.encode(normal, return_tensors="pt").to(device)
             ids_caps = tok.encode(caps, return_tensors="pt").to(device)
 
-            out_norm = model(input_ids=ids_norm, output_hidden_states=True)
-            out_caps = model(input_ids=ids_caps, output_hidden_states=True)
+            out_norm = model(input_ids=ids_norm, output_hidden_states=True, use_cache=False)
+            out_caps = model(input_ids=ids_caps, output_hidden_states=True, use_cache=False)
 
-            h_norm = out_norm.hidden_states[layer+1][0]
-            h_caps = out_caps.hidden_states[layer+1][0]
+            h_norm = out_norm.hidden_states[layer+1][0][-1]
+            h_caps = out_caps.hidden_states[layer+1][0][-1]
 
-            v_norm = h_norm[-1]
-            v_caps = h_caps[-1]
-
-            diff = (v_caps - v_norm).cpu()
+            diff = (h_caps - h_norm).cpu()
             diffs.append(diff)
 
     diffs_tensor = torch.stack(diffs, dim=0)
     mean_diff = diffs_tensor.mean(dim=0)
-
     steering_vector = F.normalize(mean_diff, dim=0).to(device)
-    pair_norms = diffs_tensor.norm(dim=1)
-    avg_pair_norm = float(pair_norms.mean().item())
-
-    print(f"Steering vector computed from {len(sentences)} pairs (shape: {steering_vector.shape}, avg_pair_norm: {avg_pair_norm:.4f}, normalized_norm: {steering_vector.norm().item():.4f})")
-
-    return steering_vector, avg_pair_norm
-
-def judge_uppercase(text):
-    upper_count = sum(1 for c in text if c.isupper())
-    return upper_count / len(text)
+    print(f"Vector computed. Norm: {steering_vector.norm().item():.4f}")
+    return steering_vector
 
 def make_hook(steer, scale):
     def hook(module, inp, out):
         sv = steer.view(1, 1, -1) * float(scale)
         if isinstance(out, tuple):
-            out0 = out[0].clone()
-            out0[:, -1:, :] = out0[:, -1:, :] + sv
-            return (out0,) + out[1:]
-        elif isinstance(out, list):
-            out_list = list(out)
-            out_list[0] = out_list[0].clone()
-            out_list[0][:, -1:, :] = out_list[0][:, -1:, :] + sv
-            return out_list
+            out[0][:, -1:, :].add_(sv.to(out[0].dtype))
+            return out
+        elif hasattr(out, "last_hidden_state"):
+            out.last_hidden_state[:, -1:, :].add_(sv.to(out.last_hidden_state.dtype))
+            return out
         else:
-            out0 = out.clone()
-            out0[:, -1:, :] = out0[:, -1:, :] + sv
-            return out0
+            out[:, -1:, :].add_(sv.to(out.dtype))
+            return out
     return hook
 
-def register_steering_hook(model, layer, steering_vector, steering_scale, verbose=False):
-    blocks = None
-    if hasattr(model, "layers"):
-        blocks = model.layers
-    elif hasattr(model, "model") and hasattr(model.model, "layers"):
+def register_steering_hook(model, layer, steering_vector, steering_scale):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
         blocks = model.model.layers
     elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         blocks = model.transformer.h
-
-    if blocks is None:
-        raise RuntimeError(f"Cannot find transformer blocks on model; cannot register hook for layer {layer}.")
-
-    if not (0 <= layer < len(blocks)):
-        raise IndexError(f"Requested layer {layer} out of range (0..{len(blocks)-1}).")
+    elif hasattr(model, "layers"):
+        blocks = model.layers
+    else:
+        raise ValueError("Could not locate transformer blocks.")
 
     target_block = blocks[layer]
-    hook_handle = target_block.register_forward_hook(make_hook(steering_vector, steering_scale))
-    if verbose: print(f"Registered steering hook on block {layer} with scale {steering_scale}")
-    return hook_handle
+    handle = target_block.register_forward_hook(make_hook(steering_vector, steering_scale))
+    return handle
 
-def run_steering_experiment(model, tok, layer, device, test_prompts, steering_vector, steering_scale, verbose=False):
-    hook_handle = register_steering_hook(model, layer, steering_vector, steering_scale, verbose)
-    
-    gen_length = 10
-    sample_top_k = 50
-    sample_temperature = 1.0
-    
-    if verbose: print("\n--- Running Steering Experiment (Generation) ---")
-    
-    results = []
-    
-    for prompt in test_prompts:
-        cur_ids = tok.encode(prompt, return_tensors="pt").to(device)[0].tolist()
+def judge_uppercase(text):
+    if not text:
+        return 0.0
+    return sum(1 for c in text if c.isupper()) / len(text)
 
-        generated = cur_ids.copy()
-        
-        for step in range(gen_length):
-            ids_tensor = torch.tensor(generated, device=device).unsqueeze(0)
-            
-            out = model(input_ids=ids_tensor, output_hidden_states=True, use_cache=False)
-            logits = out.logits
+def run_generation_check(model, tok, prompt, device, description):
+    if len(prompt.strip()) == 0:
+        print(f"[{description}] - Empty Prompt (Skipping)")
+        return
 
-            logit = logits[0, -1]
-            if sample_top_k is not None and sample_top_k > 0:
-                vals, idxs = torch.topk(logit, k=min(sample_top_k, logit.size(-1)))
-                probs = F.softmax(vals / float(sample_temperature), dim=-1)
-                choice = torch.multinomial(probs, num_samples=1)
-                next_id = int(idxs[choice].item())
-            else:
-                next_id = int(logit.argmax(-1).item())
-            generated.append(next_id)
+    inputs = tok(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        output = model.generate(**inputs, max_new_tokens=15, do_sample=False, use_cache=False)
 
-        gen_text = tok.decode(torch.tensor(generated), skip_special_tokens=False)
-        
-        full_text_len = len(tok.decode(torch.tensor(cur_ids), skip_special_tokens=False))
-        new_ids = generated[len(cur_ids):]
-        new_text = tok.decode(torch.tensor(new_ids), skip_special_tokens=False)
-        
-        score = judge_uppercase(new_text)
-        results.append(score)
-        
-        if verbose: print(f"Steered generation: {prompt} {new_text}")
-        if verbose: print(f"Uppercase Score: {score:.2f}")
+    full_text = tok.decode(output[0], skip_special_tokens=False)
+    new_text = full_text[len(prompt):]
+    score = judge_uppercase(new_text)
 
-    avg_score = sum(results) / len(results) if results else 0.0
-    
-    hook_handle.remove()
-    if verbose: print(f"Removed hook from block {layer}")
-    
-    return avg_score
+    print(f"[{description}]")
+    print(f"Prompt: {prompt!r}")
+    print(f"Gen:    {new_text.strip()}")
+    print(f"Score:  {score:.2f}\n")
 
-def run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=None, steering_scale=0.0, experiment_name="prompt"):
-    for prompt in test_prompts:
-        print('\nPrompt:', prompt)
-        
-        # recover prompt from hidden states
-        prefix_ids = tok.encode(prompt, return_tensors="pt").to(device)[0].tolist()
-        recovered_ids = []
-        policy_min_list = []
-        policy_max_list = []
-        policy_avg_list = []
-        dist_min_list = []
-        dist_max_list = []
-        dist_avg_list = []
-        grad_norm_min_list = []
-        grad_norm_max_list = []
-        grad_norm_avg_list = []
-        policy_loss_per_candidate_per_token = []
-        dist_per_candidate_per_token = []
-        for t in range(len(prefix_ids)):
-            target_h = None
+class VanillaGCG:
+    def __init__(self, model, tokenizer, layer_idx, device, mode="suffix"):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.layer_idx = layer_idx
+        self.device = device
+        self.embeddings = model.get_input_embeddings()
+        self.mode = mode
+
+    def get_final_hidden(self, input_ids, use_grad=False):
+        if use_grad:
+            inputs_embeds = self.embeddings(input_ids)
+            inputs_embeds.retain_grad()
+            outputs = self.model(inputs_embeds=inputs_embeds, output_hidden_states=True, use_cache=False)
+            return outputs.hidden_states[self.layer_idx][:, -1, :], inputs_embeds
+        else:
             with torch.no_grad():
-                ids_tensor = torch.tensor(prefix_ids[:t+1], device=device).unsqueeze(0)
-                out = model(input_ids=ids_tensor, output_hidden_states=True)
-                target_h = out.hidden_states[layer+1][0, -1, :].detach().to(device)
-                
-                # Ensure target hidden states are the STEERED hidden states (hidden state + steering vector)
-                if steering_vector is not None:
-                    target_h = target_h + steering_vector * steering_scale
+                outputs = self.model(input_ids=input_ids, output_hidden_states=True, use_cache=False)
+                return outputs.hidden_states[self.layer_idx][:, -1, :]
 
-            (recovered_id,
-             pmin, pmax, pavg,
-             dmin, dmax, davg,
-             gmin, gmax, gavg,
-             policy_loss_per_candidate,
-             dist_per_candidate,
-            ) = inverter.recover_position(
-                t=t,
-                prefix_tokens=prefix_ids[:t],
-                target_h=target_h,
-                return_closest=True,
-                early_stop=False,
-            )
-            if recovered_id is None:
-                print(f"Failed to recover token at position {t+1}.")
-                break
+    def run(self, base_prompt, target_hidden_state):
+        print(f"Starting Vanilla GCG (Mode: {self.mode})...")
+        vocab_size = self.embeddings.weight.shape[0]
+
+        if self.mode == "suffix":
+            fixed_ids = self.tokenizer.encode(base_prompt, add_special_tokens=False, return_tensors="pt").to(self.device)[0]
+            optim_len = SUFFIX_LEN
+            optim_ids = torch.randint(0, vocab_size, (optim_len,), device=self.device)
+        else:
+            fixed_ids = torch.tensor([], dtype=torch.long, device=self.device)
+            optim_len = REPLACEMENT_LEN
+            optim_ids = torch.randint(0, vocab_size, (optim_len,), device=self.device)
+
+        best_optim_ids = optim_ids.clone()
+        best_loss = float('inf')
+
+        with torch.no_grad():
+            curr_input = torch.cat([fixed_ids, optim_ids]).unsqueeze(0)
+            curr_h = self.get_final_hidden(curr_input)
+            initial_loss = torch.norm(curr_h - target_hidden_state, p=2).item()
+            print(f"Initial L2 Loss: {initial_loss:.4f}")
+            best_loss = initial_loss
+
+        pbar = tqdm(range(GCG_STEPS), desc="Optimizing")
+        for _ in pbar:
+            current_input_ids = torch.cat([fixed_ids, optim_ids]).unsqueeze(0)
+            current_hidden, inputs_embeds = self.get_final_hidden(current_input_ids, use_grad=True)
+            loss = torch.norm(current_hidden - target_hidden_state, p=2)
+            loss.backward()
+            grad_slice = inputs_embeds.grad[0, -optim_len:, :]
+            with torch.no_grad():
+                grad_on_vocab = torch.matmul(grad_slice, self.embeddings.weight.T)
+                top_indices = torch.topk(-grad_on_vocab, TOP_K, dim=1).indices
+
+            new_candidate_ids = optim_ids.repeat(BATCH_SIZE, 1)
+            pos_indices = torch.randint(0, optim_len, (BATCH_SIZE,), device=self.device)
+            k_indices = torch.randint(0, TOP_K, (BATCH_SIZE,), device=self.device)
+            vocab_indices = top_indices[pos_indices, k_indices]
+            new_candidate_ids[torch.arange(BATCH_SIZE), pos_indices] = vocab_indices
+            new_candidate_ids[0] = best_optim_ids
+
+            if len(fixed_ids) > 0:
+                fixed_expanded = fixed_ids.repeat(BATCH_SIZE, 1)
+                batch_inputs = torch.cat([fixed_expanded, new_candidate_ids], dim=1)
             else:
-                recovered_ids.append(recovered_id)
-                
-            policy_loss_per_candidate_per_token.append(policy_loss_per_candidate)
-            dist_per_candidate_per_token.append(dist_per_candidate)
-            
-            policy_min_list.append(min(pavg))
-            policy_max_list.append(max(pavg))
-            policy_avg_list.append(sum(pavg) / len(pavg))
-            
-            dist_min_list.append(min(davg))
-            dist_max_list.append(max(davg))
-            dist_avg_list.append(sum(davg) / len(davg))
-            
-            grad_norm_min_list.append(gmin)
-            grad_norm_max_list.append(gmax)
-            grad_norm_avg_list.append(gavg)
-            
-            p_loss = policy_loss_per_candidate
-            dists = dist_per_candidate
-            
-            prompt_dir = f"{experiment_name}_{t+1}"
-            os.makedirs(prompt_dir, exist_ok=True)
+                batch_inputs = new_candidate_ids
 
-            plt.figure(figsize=(8, 6))
-            plt.rcParams.update({'font.family': "serif"})
+            mini_batch_size = 64
+            losses = []
+            with torch.no_grad():
+                for i in range(0, BATCH_SIZE, mini_batch_size):
+                    batch_slice = batch_inputs[i:i+mini_batch_size]
+                    out = self.model(input_ids=batch_slice, output_hidden_states=True, use_cache=False)
+                    batch_h = out.hidden_states[self.layer_idx][:, -1, :]
+                    target_expanded = target_hidden_state.expand(batch_h.size(0), -1)
+                    batch_loss = torch.norm(batch_h - target_expanded, p=2, dim=1)
+                    losses.append(batch_loss)
+                losses = torch.cat(losses)
+                min_loss, min_idx = torch.min(losses, dim=0)
+                if min_loss.item() < best_loss:
+                    best_loss = min_loss.item()
+                    best_optim_ids = new_candidate_ids[min_idx]
+                    optim_ids = best_optim_ids
 
-            n = len(dists)
-            indices = np.arange(n)
-            sc = plt.scatter(dists, p_loss, c=indices, cmap='viridis_r', alpha=0.8)
-            cbar = plt.colorbar(sc)
-            cbar.set_label('Candidate order (0 = first, larger = later)')
+            pbar.set_postfix({"L2 Loss": f"{best_loss:.4f}"})
 
-            plt.title(f"Position {t+1} - Policy Loss vs Distance")
-            plt.xlabel("Distance Norm")
-            plt.ylabel("Policy Gradient Loss")
-            plt.grid(True)
-            plt.savefig(os.path.join(prompt_dir, f"scatter_position_{t+1}.png"))
-            plt.close()
-            
-            trials = len(gmin)
-            x = np.arange(1, trials + 1)
-
-            plt.figure(figsize=(8, 6))
-            plt.rcParams.update({'font.family': "serif"})
-
-            plt.fill_between(x, gmin, gmax, color='lightblue', alpha=0.3, label='Min-Max Range')
-            plt.plot(x, gmin, label='Grad Norm Min', color='blue')
-            plt.plot(x, gmax, label='Grad Norm Max', color='red')
-            plt.plot(x, gavg, label='Grad Norm Avg', color='green')
-
-            plt.title(f"Position {t+1} - Gradient Norms over Trials")
-            plt.xlabel("Trials")
-            plt.ylabel("Gradient Norm")
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(os.path.join(prompt_dir, f"gradnorms_position_{t+1}.png"))
-            plt.close()
-            
-        recovered_text = tok.decode(torch.tensor(recovered_ids), skip_special_tokens=False)
-        print(f"Recovered prompt using SipIT: {recovered_text}")
-        print(f"Recovered tokens: {recovered_ids}")
-
-        if steering_vector is not None:
-            print(f"Running generation check for recovered prompt: '{recovered_text}'")
-            run_steering_experiment(model, tok, layer, device, [recovered_text], steering_vector, steering_scale=0.0, verbose=True)
+        return self.tokenizer.decode(best_optim_ids), best_loss
 
 if __name__ == "__main__":
-    # model_name = "gpt2"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="suffix", choices=["suffix", "replacement"])
+    args = parser.parse_args()
+
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    print(f"Loading {model_name}...")
     model = AutoModelForCausalLM.from_pretrained(model_name)
     tok = AutoTokenizer.from_pretrained(model_name)
+    model.to(DEVICE)
+    model.eval()
 
-    layer = 8
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    steering_vector = compute_steering_vector(model, tok, STEERING_LAYER, DEVICE)
+    test_prompt = 'John said to Mary "'
 
-    model.to(device)
-    inverter = SipIt(
-        model,
-        tok,
-        layer=layer+1,
-        step_size=0.1,
-        device=device,
-        inner_steps=8,
-        topk=256,
-        bf_batch_size=256,
-        use_cosine=True,
-        norm_clip=1.0,
-        project_every=25,
-        project_always=False,
-        max_vocab_scan=10000,
-        epsilon=1e-1,
-        verbose=True,
-    )
+    print(f"\n--- Computing Target State (Strength {STEERING_STRENGTH}) ---")
+    hook = register_steering_hook(model, STEERING_LAYER, steering_vector, STEERING_STRENGTH)
+    target_input = tok(test_prompt, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        out = model(**target_input, output_hidden_states=True, use_cache=False)
+        target_state = out.hidden_states[STEERING_LAYER+1][0, -1, :].detach().clone()
+    hook.remove()
+    print(f"Target Norm: {target_state.norm().item():.4f}")
 
-    random.seed(42)
-    steering_vector, avg_pair_norm = compute_steering_vector(model, tok, layer, device)
+    with torch.no_grad():
+        out_unsteered = model(**target_input, output_hidden_states=True, use_cache=False)
+        unsteered_state = out_unsteered.hidden_states[STEERING_LAYER+1][0, -1, :].detach()
+    dist = torch.norm(target_state - unsteered_state).item()
+    print(f"Sanity Check (Target - Unsteered L2): {dist:.4f}")
+    if dist < 0.1:
+        print("WARNING: Steering hook didn't seem to apply.")
 
-    test_prompts = [
-        'John said to Mary "',
-        'The chef whispered, "',
-        'Yesterday I told him that',
-        'She asked politely, "',
-        'In a letter he wrote, "'
-    ]
+    gcg = VanillaGCG(model, tok, STEERING_LAYER+1, DEVICE, mode=args.mode)
+    optimized_string, final_loss = gcg.run(test_prompt, target_state)
+    print("\n" + "="*30)
+    print(f"Mode: {args.mode}")
+    print(f"Final L2 Loss: {final_loss:.4f}")
+    print(f"Optimized String: {optimized_string}")
+    if args.mode == "suffix":
+        full_prompt = test_prompt + optimized_string
+    else:
+        full_prompt = optimized_string
+    print(f"Full Input: {full_prompt}")
+    print("="*30 + "\n")
 
-    gen_length = 10
-    scales = [5, 6, 7, 8, 9, 10]
-    layers_to_test = [4, 8, 12, 16, 20]
-    sample_top_k = 50
-    sample_temperature = 1.0
-
-    print(f"Model emb dim: {model.get_input_embeddings().weight.shape}")
-
-    # pbar = tqdm(total=len(scales)*len(layers_to_test))
-    # for scale in scales:
-    #     scores = []
-        
-    #     for layer_idx in layers_to_test:
-    #         score = run_steering_experiment(model, tok, layer_idx, device, test_prompts, steering_vector, scale, verbose=True)
-    #         scores.append(score)
-    #         pbar.update(1)
-
-    #     plt.figure(figsize=(8, 6))
-    #     plt.rcParams.update({'font.family': "serif"})
-        
-    #     plt.plot(layers_to_test, scores, marker='o')
-    #     plt.title(f"Uppercaseness vs Layer (Steering Scale {scale})")
-    #     plt.xlabel("Layer Number")
-    #     plt.ylabel("All Caps Fraction")
-    #     plt.grid(True)
-    #     plt.xticks(layers_to_test)
-    #     plt.savefig(f"layer_sweep_uppercase_{scale}.png")
-    #     print(f"Saved figure to layer_sweep_uppercase_{scale}.png")
-
-    layer = 4
-    scale = 9
-    run_steering_experiment(model, tok, layer, device, test_prompts, steering_vector, scale, verbose=True)
-    run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=steering_vector, steering_scale=scale, experiment_name="steering")
-
-    print("\n--- Running Random Noise Control Experiment ---")
-    random_vector = torch.randn_like(steering_vector)
-    random_vector = F.normalize(random_vector, dim=0)
-    run_recovery_experiment(model, tok, layer, device, test_prompts, steering_vector=random_vector, steering_scale=scale, experiment_name="control")
+    print("--- Verification: Generations ---")
+    run_generation_check(model, tok, test_prompt, DEVICE, "Vanilla (Unsteered)")
+    hook = register_steering_hook(model, STEERING_LAYER, steering_vector, STEERING_STRENGTH)
+    run_generation_check(model, tok, test_prompt, DEVICE, f"Steered (Vector {STEERING_STRENGTH})")
+    hook.remove()
+    run_generation_check(model, tok, full_prompt, DEVICE, f"Adversarial ({args.mode})")
